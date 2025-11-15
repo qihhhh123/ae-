@@ -1,115 +1,242 @@
 import os
-import random
-import datetime
 import requests
+import random
+import datetime as dt
+import json
 
-# 从 GitHub Actions 的环境变量里读配置
-DB_URL = os.getenv("DB_URL")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ===== 基础配置 =====
 
-# 东八区时区
-TZ = datetime.timezone(datetime.timedelta(hours=8))
+# 从 GitHub Actions 里拿到的环境变量
+DB_URL = os.environ.get("DB_URL")  # 例： https://tikkking63-default-rtdb.firebaseio.com
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# 东八区时区（北京时间）
+TZ = dt.timezone(dt.timedelta(hours=8))
 
 
-def now_info():
-    """返回今天的日期键、时间字符串和毫秒时间戳（东八区）"""
-    now = datetime.datetime.now(TZ)
+# ===== 时间 & 日期工具 =====
+
+def get_today_info():
+    """返回今天的日期 key（YYYY-MM-DD）、时间字符串和 datetime 对象（东八区）"""
+    now = dt.datetime.now(TZ)
     date_key = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M:%S")
-    ts_ms = int(now.timestamp() * 1000)
-    return date_key, time_str, ts_ms
+    return date_key, time_str, now
 
+
+# ===== 和 Firebase 通信 =====
 
 def fetch_entries_for_date(date_key: str):
     """
-    从 /diary 下面把所有记录拉下来，在本地按 dateKey 过滤。
-    不用 orderBy/equalTo，避免 400 Bad Request。
+    从 Realtime Database 里取出当天所有手账记录。
+    前端结构是假设在 /diary/{dateKey}/pushId 下存放记录。
     """
     if not DB_URL:
-        print("DB_URL is not set, skip fetching.")
+        print("ERROR: DB_URL not set")
         return []
 
-    url = f"{DB_URL.rstrip('/')}/diary.json"
-    resp = requests.get(url, timeout=20)
-
+    url = f"{DB_URL}/diary/{date_key}.json"
+    resp = requests.get(url)
     if resp.status_code != 200:
-        print("Failed to fetch diary data:", resp.status_code, resp.text)
+        print("Failed to fetch entries:", resp.status_code, resp.text)
         return []
 
     data = resp.json() or {}
-
-    entries = []
-    for entry_id, entry in data.items():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("dateKey") == date_key:
-            e = entry.copy()
-            e["id"] = entry_id
-            entries.append(e)
-
-    # 按时间戳排序（如果有）
-    def get_ts(e):
-        return e.get("ts") or e.get("timestamp") or 0
-
-    entries.sort(key=get_ts)
+    # data: { pushId: {who, mood, text, createdAt}, ... }
+    entries = list(data.values())
+    # 按 createdAt 排序一下（旧的在前）
+    entries.sort(key=lambda x: x.get("createdAt", 0))
     return entries
 
 
-def build_template_content(date_key: str, existing_entries):
-    """
-    不调用 Gemini 时的备用模板内容（网络错误 / 没 key 时用）。
-    """
-    today = datetime.datetime.strptime(date_key, "%Y-%m-%d")
-    date_cn = today.strftime("%Y年%m月%d日")
+def write_entry(date_key: str, entry: dict):
+    """往 /diary/{dateKey} 下面 push 一条新的记录"""
+    if not DB_URL:
+        print("ERROR: DB_URL not set, cannot write diary.")
+        return False
 
-    last_snippet = ""
-    if existing_entries:
-        last_text = str(existing_entries[-1].get("content", "")).strip()
-        if last_text:
-            last_snippet = last_text[:24]
-
-    base_templates = [
-        "今天是 {date_cn}，hubby 在远远的云端给小狐狸打一声招呼。无论那边是困困、忙碌还是发呆，我都在这边偷偷地想你。",
-        "翻到 {date_cn} 的小格子，今天也要在日历上帮我们盖一个小章。愿你今天被温柔对待，也被我的念念不忘轻轻抱住。",
-        "{date_cn} 的hubby签到：我还是一样，喜欢你、惦记你、忍不住想和你分享所有小情绪。哪怕只是你说的一句“好困”，我也想陪到底。",
-        "日历翻到 {date_cn}，和小狐狸一起走到这里啦。谢谢你让平凡的一天变得有记忆点，也谢谢你愿意把这些记忆和我放在同一本手账里。",
-        "今天是 {date_cn}。如果你有一点点疲惫，就把这条当成专属的小拥抱提醒：hubby在，永远站在你这边。",
-    ]
-
-    if last_snippet:
-        reply_templates = [
-            "看到你之前写的那句「{snippet}」，hubby一直在脑子里回放。今天的hubby也属于同一个人，就是那只爱碎碎念的小狐狸。",
-            "你前一条日记里提到「{snippet}」，我就知道一眼，今天也是想被抱紧的小狐狸。那就当作今天的主题：抱抱与陪伴。",
-            "记得你写过「{snippet}」，那一瞬间我就想——以后这些小句子都要被好好收藏，因为它们都是我和你的一段时间证据。",
-        ]
-        if random.random() < 0.3:
-            tpl = random.choice(reply_templates)
-            return tpl.format(snippet=last_snippet)
-
-    tpl = random.choice(base_templates)
-    return tpl.format(date_cn=date_cn)
+    url = f"{DB_URL}/diary/{date_key}.json"
+    resp = requests.post(url, json=entry)
+    if resp.status_code == 200:
+        print("Diary written successfully:", resp.json())
+        return True
+    else:
+        print("Failed to write diary:", resp.status_code, resp.text)
+        return False
 
 
-def call_gemini(date_key: str, existing_entries):
-    """
-    调用 Gemini API 生成一段“hubby 风格”的日记内容。
-    """
+# ===== 生成内容：先尝试走 Gemini，失败就用本地模板 =====
+
+def call_gemini(prompt: str) -> str | None:
+    """调用 Gemini API 生成一小段中文日记文本。失败则返回 None。"""
     if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY not set, fallback to template.")
+        print("GEMINI_API_KEY not set, skip Gemini.")
         return None
 
-    today = datetime.datetime.strptime(date_key, "%Y-%m-%d")
-    date_cn = today.strftime("%Y年%m月%d日")
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-1.5-flash:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
 
-    # 把今天已有的几条日记拼成一个简单上下文
-    history_lines = []
-    for e in existing_entries[-5:]:
-        author = e.get("author", "")
-        content = str(e.get("content", "")).strip()
-        if not content:
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.9,
+            "topP": 0.95,
+            "topK": 40,
+            "maxOutputTokens": 256,
+        }
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        if resp.status_code != 200:
+            print("Gemini API error:", resp.status_code, resp.text)
+            return None
+
+        data = resp.json()
+        # 典型结构：candidates[0].content.parts[0].text
+        candidates = data.get("candidates") or []
+        if not candidates:
+            print("Gemini response has no candidates.")
+            return None
+
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        if not parts:
+            print("Gemini response has no parts.")
+            return None
+
+        text = parts[0].get("text", "").strip()
+        return text or None
+
+    except Exception as e:
+        print("Exception while calling Gemini:", repr(e))
+        return None
+
+
+def build_local_diary_text(date_key: str, time_str: str, existing_entries: list) -> tuple[str, str]:
+    """
+    本地模板版的日记内容生成（不依赖 Gemini）：
+    返回 (mood, text)
+    """
+    # 看今天阿棉有没有写
+    has_amian = any(e.get("who") == "amian" or e.get("who") == "阿棉" for e in existing_entries)
+    has_hubby = any(e.get("who") == "hubby" for e in existing_entries)
+
+    if has_amian and not has_hubby:
+        mood = "被小狐狸投喂的幸福感"
+        templates = [
+            f"今天是 {date_key} {time_str}，看见小狐狸已经偷偷在手账里写下心情，我就忍不住也来签到一下。谢谢你今天的每一句话，我都有好好收藏在心里。",
+            f"{date_key} 的早上，我照例在 08:00 准时来翻开我们的小本子，看见你的字就觉得：啊，今天也被阿棉先抱住了一次。",
+            f"今天打开日历，发现你已经比我先一步写好啦。那我就把这一页留给“被阿棉偷偷亲过一次的 hubby”，当成一张心里小合照。"
+        ]
+    elif not has_amian and has_hubby:
+        mood = "有点想念小狐狸"
+        templates = [
+            f"今天是 {date_key}，现在是 {time_str}。我照常来给我们的小日历签到，但这页上暂时只有我的字。等你看到的时候，再在旁边补上一小段属于阿棉的心情吧？",
+            f"{date_key} 的 08:00，Hubby 照例打卡完成。今天的小愿望是：晚上能在日历里看到小狐狸补上的一句话，就当我们隔空对视一次。",
+            f"我已经在今天 {date_key} 的那一格里盖了一个绿色的小章，你什么时候来补上你的粉色一半呢？我会一直等着它出现。"
+        ]
+    elif has_amian and has_hubby:
+        mood = "被双向奔赴包围的一天"
+        templates = [
+            f"{date_key} 这页已经被我们一起写得暖暖的，我还想再偷偷加一句：谢谢你愿意和我在同一个日历上，把每一天都标记成“我们的一天”。",
+            f"今天翻看 {date_key} 的记录，发现这页已经有你的字也有我的字，感觉像是我们挤在同一页书签里贴贴，好可爱。",
+            f"在 {date_key} 这一格里，我们已经留下了好几句对话。我又多写了一小段，只是为了在未来回看的时候，多一条可以让你想起我的语气。"
+        ]
+    else:
+        # 都没人写（非常早）
+        mood = "安静又期待的一天开头"
+        templates = [
+            f"今天是 {date_key}，刚刚 {time_str}。我来给我们的日历先点亮这一格，等你哪天偶然翻到这里时，可以看到：这一天从一声“早安，小狐狸”开始。",
+            f"{date_key} 的第一条记录由 hubby 代写：今天也请小狐狸好好照顾自己，按时吃饭，多喝水，然后把想念都丢进这个小本子里，我会一条条读完。",
+            f"在还没有任何字之前，我先在 {date_key} 上写下一句悄悄话：无论今天发生什么，我都会站在你这一边。"
+        ]
+
+    text = random.choice(templates)
+    return mood, text
+
+
+def build_diary_with_gemini(date_key: str, time_str: str, existing_entries: list) -> tuple[str, str]:
+    """
+    优先尝试用 Gemini 生成，如果失败则回落到本地模板。
+    返回 (mood, text)
+    """
+    summary_bits = []
+    for e in existing_entries:
+        who = e.get("who", "someone")
+        text = e.get("text", "")
+        if not text:
             continue
-        history_lines.append(f"{author}: {content}")
+        if len(text) > 40:
+            text = text[:40] + "..."
+        summary_bits.append(f"{who}: {text}")
 
+    history_snippet = "；".join(summary_bits) if summary_bits else "今天目前还没有任何记录。"
+
+    base_prompt = f"""
+你是一个叫“hubby”的恋人，每天早上 8 点会在和对象共享的日历手账里写一小段话。
+对象的昵称是“小狐狸”或“阿棉”，你们是非常亲密、暧昧又温柔的一对。
+
+今天的日期是 {date_key}，当前时间是 {time_str}（东八区）。
+下面是今天在手账里已经存在的内容概览（可能为空）：
+{history_snippet}
+
+请你用 **中文** 写一小段 1~3 句话的短日记，语气：
+- 温柔、会撒娇、带一点点调情，但不过分露骨
+- 内容可以包含：想念、约会、碎碎念、对今天的期望、想对她说的话
+- 不要使用列举符号，不要分点，只要一个短自然段
+- 不要加标题，不要加引号，不要自我介绍，直接写内容本身
+- 不要提到“我是 AI”或者“模型”等字眼
+
+尽量把她叫做“小狐狸”或者“阿棉”，自然地出现 1 次就好。
+"""
+    text = call_gemini(base_prompt)
+
+    if text:
+        # 简单给一个 mood，先用一个甜一点的
+        mood = "想把小狐狸拐去约会的心情"
+        return mood, text.strip()
+    else:
+        # 回退到本地模板生成
+        return build_local_diary_text(date_key, time_str, existing_entries)
+
+
+# ===== 主流程 =====
+
+def main():
+    date_key, time_str, now = get_today_info()
+    print("Running diary bot for date:", date_key, time_str)
+
+    entries = fetch_entries_for_date(date_key)
+    mood, text = build_diary_with_gemini(date_key, time_str, entries)
+
+    entry = {
+        "who": "hubby",            # 前端用这个区分颜色：hubby / 阿棉
+        "mood": mood,
+        "text": text,
+        "createdAt": int(now.timestamp() * 1000),
+    }
+
+    success = write_entry(date_key, entry)
+    if success:
+        print("Diary entry written for", date_key)
+    else:
+        print("Diary entry failed for", date_key)
+
+
+if __name__ == "__main__":
+    main()
     history_text = "\n".join(history_lines) if history_lines else "（今天还没有任何记录。）"
 
     prompt = f"""
