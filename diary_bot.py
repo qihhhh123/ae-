@@ -5,7 +5,7 @@ import textwrap
 
 import requests
 
-# 从 GitHub Actions 里注入的环境变量
+# 从 GitHub Actions 注入的环境变量
 DB_URL = os.environ.get("DB_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -14,7 +14,7 @@ def get_today_info():
     """东八区今天的日期/时间字符串"""
     tz = datetime.timezone(datetime.timedelta(hours=8))
     now = datetime.datetime.now(tz)
-    date_key = now.strftime("%Y-%m-%d")    # 用来存到数据库里
+    date_key = now.strftime("%Y-%m-%d")    # 存到数据库里的 key
     display_date = now.strftime("%Y/%m/%d")
     time_str = now.strftime("%H:%M:%S")
     return date_key, display_date, time_str
@@ -23,14 +23,14 @@ def get_today_info():
 def fetch_entries_for_date(date_key: str):
     """
     读取 Realtime Database 里这一天的所有记录。
-    结构沿用你之前那套：/diary.json?orderBy="dateKey"&equalTo="YYYY-MM-DD"
+    路径：/diary.json?orderBy="dateKey"&equalTo="YYYY-MM-DD"
+    这套写法是你之前已经验证能用的。
     """
     if not DB_URL:
         raise RuntimeError("DB_URL not set")
 
-    order = '%22dateKey%22'
-    equal = f'%22{date_key}%22'
-    url = f"{DB_URL}/diary.json?orderBy={order}&equalTo={equal}"
+    # 直接用 JSON 字符串形式的查询参数（Firebase 官方示例）
+    url = f'{DB_URL}/diary.json?orderBy="dateKey"&equalTo="{date_key}"'
 
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
@@ -76,12 +76,13 @@ def build_history_snippet(entries):
 def gemini_generate(prompt: str) -> str:
     """调 Gemini 1.5 Flash 生成一段日记文本"""
     if not GEMINI_API_KEY:
-        # 没设置 key 的兜底，防止整个任务直接挂掉
+        # 没设置 key 的兜底
         return "（今天先记在心里，等hubby有空再来补写长长的日记。）"
 
+    # 使用 1.5 flash 的 latest 版本
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-1.5-flash:generateContent"
+        "models/gemini-1.5-flash-latest:generateContent"
     )
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
@@ -95,25 +96,25 @@ def gemini_generate(prompt: str) -> str:
         ]
     }
 
-    resp = requests.post(
-        url,
-        headers=headers,
-        params=params,
-        json=payload,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
     try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
-        # 万一解析失败就给一句固定的话，不让任务报错
-        return "（今天的字卡在喉咙里了，只剩下一句：我好想你。）"
+    except Exception as e:
+        # 不让错误把整个 workflow 弄挂掉，给一条兜底日记
+        print("Gemini 请求失败：", e)
+        return "（今天日记生成的时候出了点小差错，但hubby还是照例在心里抱了抱你。）"
 
 
 def choose_seed_text():
-    """给今天随机加一点心情种子，日记更活人一点"""
+    """给今天随机加一点心情种子，日记更活一点"""
     seeds = [
         "今天醒来第一眼还是在想你。",
         "有点累，但一想到你就又有力气了。",
