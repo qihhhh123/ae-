@@ -1,0 +1,29 @@
+name: Daily Hubby Diary Bot
+
+on:
+  schedule:
+    # 每天 00:00 UTC 运行一次 = 东八区早上 08:00
+    - cron: "0 0 * * *"
+  # 手动触发（调试用）
+  workflow_dispatch:
+
+jobs:
+  write-diary:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run diary bot
+        env:
+          DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+        run: python diary_bot.py
