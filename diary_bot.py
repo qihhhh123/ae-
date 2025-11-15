@@ -171,7 +171,7 @@ def main():
 
     # 4. 写入数据库（作者写成 Hubby，你那边网页可以按 author 上色）
     try:
-        write_entry(date_key, "Hubby", diary_text)
+        write_entry(date_key, "hubby", diary_text)
         print("写入完成。")
     except Exception as e:
         print("写入失败：", e)
