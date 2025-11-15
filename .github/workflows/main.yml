@@ -1,9 +1,10 @@
 name: Daily Hubby Diary Bot
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"  # 每天 08:00 东八区（= UTC 0:00）
+    # 每天 00:00 UTC = 东八区早上 08:00
+    - cron: "0 0 * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -11,15 +12,15 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests google-generativeai pytz
+        run: pip install requests
 
       - name: Run diary bot
         env:
