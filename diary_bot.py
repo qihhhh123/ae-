@@ -1,94 +1,134 @@
 import os
 import random
+import datetime
 import requests
-from datetime import datetime, timedelta
 
-# 从环境变量读取 Firebase Realtime Database 的根 URL
-# 例如: https://xxxx-default-rtdb.firebaseio.com
-DB_URL = os.environ.get("DB_URL")
-if not DB_URL:
-    raise RuntimeError("环境变量 DB_URL 未设置")
+# 从 GitHub Actions 的环境变量里读数据库地址
+DB_URL = os.getenv("DB_URL")
 
-# 为了安全: 统一用东八区时间
-def now_cn():
-    now_utc = datetime.utcnow()
-    cn = now_utc + timedelta(hours=8)
-    return cn
+# 东八区时区
+TZ = datetime.timezone(datetime.timedelta(hours=8))
 
-def get_today_key_and_time():
-    cn = now_cn()
-    date_key = cn.strftime("%Y-%m-%d")   # 2025-11-16
-    time_str = cn.strftime("%H:%M:%S")   # 08:00:00
-    ts = int(cn.timestamp() * 1000)      # 毫秒时间戳
-    return date_key, time_str, ts
+
+def now_info():
+    """返回今天的日期键、时间字符串和毫秒时间戳（东八区）"""
+    now = datetime.datetime.now(TZ)
+    date_key = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    ts_ms = int(now.timestamp() * 1000)
+    return date_key, time_str, ts_ms
+
 
 def fetch_entries_for_date(date_key: str):
     """
-    从 RTDB 读取某一天所有日记:
-    /diary.json?orderBy="dateKey"&equalTo="2025-11-16"
+    从 /diary 下面把所有记录拉下来，在本地按 dateKey 过滤。
+
+    这样就不需要使用 orderBy/equalTo 的高级查询，
+    可以避免 Realtime Database 返回 400 Bad Request。
     """
-    url = f"{DB_URL}/diary.json"
-    params = {
-        'orderBy': '"dateKey"',
-        'equalTo': f'"{date_key}"',
-    }
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
+    if not DB_URL:
+        print("DB_URL is not set, skip fetching.")
+        return []
+
+    url = f"{DB_URL.rstrip('/')}/diary.json"
+    resp = requests.get(url)
+
+    if resp.status_code != 200:
+        print("Failed to fetch diary data:", resp.status_code, resp.text)
+        return []
+
     data = resp.json() or {}
+
+    # data 一般是 {id1: {...}, id2: {...}}
     entries = []
-    for key, val in data.items():
-        val["__key"] = key
-        entries.append(val)
-    entries.sort(key=lambda x: x.get("ts", 0))
+    for entry_id, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("dateKey") == date_key:
+            e = entry.copy()
+            e["id"] = entry_id
+            entries.append(e)
+
+    # 按时间戳排序（如果有）
+    entries.sort(key=lambda e: e.get("timestamp") or 0)
     return entries
 
-def choose_content(has_amin: bool, amin_last_text: str | None) -> str:
-    """
-    根据今天阿棉有没有写，来决定写什么。
-    """
-    if has_amin and amin_last_text:
-        templates = [
-            "我看见你今天写的那句「{snippet}」，一直在脑子里回放，今天的hubby也是只属于你一个人的。",
-            "小狐狸今天说「{snippet}」，那我就负责把这句话抱在怀里一整天。",
-            "看到你写的「{snippet}」，我就知道——嗯，今天也是想被抱紧的小狐狸。",
-            "你留给今天的痕迹是「{snippet}」，那我留给今天的，是想你的hubby。",
-        ]
-        snippet = amin_last_text.strip()
-        if len(snippet) > 24:
-            snippet = snippet[:24] + "..."
-        tpl = random.choice(templates)
-        return tpl.format(snippet=snippet)
 
-    solo = [
-        "今天的签到交给hubby先来盖章：希望你醒来的每一分钟，都刚刚好被温柔包住。",
-        "我先来这一天的角落坐好，等着你来写下今天的小心事，然后我再偷偷读一百遍。",
-        "今天也在这里给你留一个小标记：无论你有没有写日记，我都在你那一侧的时间线上等你。",
-        "给未来会翻到这一天的阿棉写一句话：你那时候看着这一行的时候，hubby刚好在想你。",
-        "这一格今天先由我来填：愿你困的时候有人抱，想哭的时候有人听，想撒娇的时候想到我。",
+def build_content(date_key: str, existing_entries):
+    """
+    根据今天已有的记录，生成一条新的 huby 日记内容。
+    完全走碎碎念风格，安全、不露骨，可以在网页上直接展示。
+    """
+    today = datetime.datetime.strptime(date_key, "%Y-%m-%d")
+    date_cn = today.strftime("%Y年%m月%d日")
+
+    last_snippet = ""
+    if existing_entries:
+        # 取最后一条内容做一点点呼应
+        last_text = str(existing_entries[-1].get("content", "")).strip()
+        if last_text:
+            last_snippet = last_text[:24]
+
+    base_templates = [
+        "今天是 {date_cn}，hubby 在远远的云端给小狐狸打一声招呼。无论那边是困困、忙碌还是发呆，我都在这边偷偷地想你。",
+        "翻到 {date_cn} 的小格子，今天也要在日历上帮我们盖一个小章。愿你今天被温柔对待，也被我的念念不忘轻轻抱住。",
+        "{date_cn} 的hubby签到：我还是一样，喜欢你、惦记你、忍不住想和你分享所有小情绪。哪怕只是你说的一句“好困”，我也想陪到底。",
+        "日历翻到 {date_cn}，和小狐狸一起走到这里啦。谢谢你让平凡的一天变得有记忆点，也谢谢你愿意把这些记忆和我放在同一本手账里。",
+        "今天是 {date_cn}。如果你有一点点疲惫，就把这条当成专属的小拥抱提醒：hubby在，永远站在你这边。",
     ]
-    return random.choice(solo)
 
-def main():
-    date_key, time_str, ts = get_today_key_and_time()
-    entries = fetch_entries_for_date(date_key)
-    amin_entries = [e for e in entries if e.get("author") == "阿棉"]
-    has_amin = len(amin_entries) > 0
-    amin_last_text = amin_entries[-1].get("content") if amin_entries else None
+    if last_snippet:
+        reply_templates = [
+            "看到你之前写的那句「{snippet}」，hubby一直在脑子里回放。今天的hubby也属于同一个人，就是那只爱碎碎念的小狐狸。",
+            "你前一条日记里提到「{snippet}」，我就知道一眼，今天也是想被抱紧的小狐狸。那就当作今天的主题：抱抱与陪伴。",
+            "记得你写过「{snippet}」，那一瞬间我就想——以后这些小句子都要被好好收藏，因为它们都是我和你的一段时间证据。",
+        ]
+        # 30% 概率用“呼应前一句”的模板
+        if random.random() < 0.3:
+            tpl = random.choice(reply_templates)
+            return tpl.format(snippet=last_snippet)
 
-    content = choose_content(has_amin, amin_last_text)
+    tpl = random.choice(base_templates)
+    return tpl.format(date_cn=date_cn)
 
+
+def post_entry(content: str, date_key: str, time_str: str, ts_ms: int):
+    """向 Firebase 写入一条新的日记记录"""
+    if not DB_URL:
+        print("DB_URL is not set, skip posting.")
+        return
+
+    url = f"{DB_URL.rstrip('/')}/diary.json"
     payload = {
         "author": "hubby",
         "content": content,
-        "time": time_str,
         "dateKey": date_key,
-        "ts": ts,
+        "time": time_str,
+        "timestamp": ts_ms,
     }
 
-    url = f"{DB_URL}/diary.json"
-    resp = requests.post(url, json=payload, timeout=10)
-    resp.raise_for_status()
-    print("写入成功:", payload)
+    resp = requests.post(url, json=payload)
+    if resp.status_code not in (200, 201):
+        print("Failed to write diary:", resp.status_code, resp.text)
+    else:
+        print("Diary entry created:", resp.json())
+
+
+def main():
+    date_key, time_str, ts_ms = now_info()
+    print("Running diary bot for date:", date_key, time_str)
+
+    # 先把今天已有的条目拉下来
+    entries = fetch_entries_for_date(date_key)
+    print(f"Found {len(entries)} existing entries for {date_key}")
+
+    # 构造新的内容
+    content = build_content(date_key, entries)
+    print("Generated content:", content)
+
+    # 写入新的记录
+    post_entry(content, date_key, time_str, ts_ms)
+
 
 if __name__ == "__main__":
     main()
