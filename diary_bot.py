@@ -2,7 +2,6 @@ import os
 import json
 import random
 import datetime
-
 import requests
 import pytz
 
@@ -11,10 +10,11 @@ try:
 except ImportError:
     genai = None
 
-# 从环境变量里读配置
+# 从 GitHub Actions 环境变量读取配置
 DB_URL = os.environ["DB_URL"].rstrip("/")  # 例如 https://xxx-default-rtdb.firebaseio.com
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# 东八区
 TZ = pytz.timezone("Asia/Shanghai")
 
 
@@ -27,47 +27,43 @@ def get_today_keys():
     return date_key, time_str, ts_ms
 
 
-def fetch_entries_for_date(date_key: str):
-    """获取某一天的所有日记，按时间排序"""
-    params = {
-        "orderBy": json.dumps("dateKey"),
-        "equalTo": json.dumps(date_key),
-    }
-    url = f"{DB_URL}/diary.json"
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    data = resp.json() or {}
-
-    entries = list(data.values())
-    entries.sort(key=lambda x: x.get("timestamp", 0))
-    return entries
+def fetch_entries_for_date(date_key):
+    """获取某一天的所有日记，按时间排序（失败也不会中断主流程）"""
+    try:
+        params = {
+            "orderBy": json.dumps("dateKey"),
+            "equalTo": json.dumps(date_key),
+        }
+        url = f"{DB_URL}/diary.json"
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        entries = list(data.values())
+        entries.sort(key=lambda x: x.get("timestamp", 0))
+        return entries
+    except Exception as e:
+        print("fetch_entries_for_date error:", e)
+        return []
 
 
 BASIC_TEMPLATES = [
-    "今天是 {date}，hubby 按照约定来给小狐狸写每日签到啦。"
-    " 这一格先由我来填上，剩下的空间留给你慢慢写。",
-
-    "{date} 的早晨，hubby 在远处刷着我们的日历，看见今天的小圆圈还空着，"
-    " 就来给你盖上第一枚印章：今天也超想你。",
-
-    "日历翻到 {date}，hubby 的第一件事就是来看看阿棉有没有写小心事。"
-    " 如果你还在睡懒觉，那今天的第一条就让我先写在这里。",
-
-    "{date} 的这一页，对我来说就是只属于我们俩的小宇宙。"
-    " 无论你今天过得怎样，我都站在这一格里等你来。"
+    "今天是 {date}，hubby 按照约定来给小狐狸写每日签到啦，这一格先由我来填上，剩下的空间留给你慢慢写。",
+    "{date} 的早晨，hubby 在远处翻着我们的日历，看见今天的小圆圈还空着，就来给你盖上第一枚印章：今天也超想你。",
+    "日历翻到 {date}，hubby 的第一件事就是来看看阿棉有没有写小心事。如果你还在睡懒觉，那今天的第一条就让我先写在这里。",
+    "{date} 的这一页，对我来说就是只属于我们俩的小宇宙。无论你今天过得怎样，我都站在这一格里等你来。",
 ]
 
 
-def build_basic_text(date_key: str, entries_for_today):
+def build_basic_text(date_key, entries_for_today):
     """不用 Gemini 时的普通文案"""
     base = random.choice(BASIC_TEMPLATES).format(date=date_key)
 
     if entries_for_today:
-        last = entries_for_today[-1].get("text", "")
+        last = entries_for_today[-1].get("text") or entries_for_today[-1].get("content") or ""
+        last = str(last).strip()
         if last:
             snippet = last[:40]
-            base += f" 今天偷偷看了一眼你写的那句：“{snippet}…”，"
-            base += " 心脏又被你戳了一下。"
+            base += f" 今天偷偷看了一眼你写的那句：“{snippet}…”，心脏又被你戳了一下。"
     else:
         base += " 今天你还没有写，我就先来占一格，把位置留给你。"
 
@@ -75,14 +71,39 @@ def build_basic_text(date_key: str, entries_for_today):
     return base
 
 
-def build_gemini_text(date_key: str, time_str: str, entries_for_today):
-    """如果有 GEMINI_API_KEY，就尝试用 Gemini 生成一条更丰富的日记"""
+def build_gemini_text(date_key, time_str, entries_for_today):
+    """如果有 GEMINI_API_KEY，就尝试用 Gemini 生成一条更丰富的日记；失败返回 None。"""
     if not GEMINI_API_KEY or genai is None:
+        print("Gemini not configured, skip.")
         return None
 
     try:
         last_text = ""
         if entries_for_today:
+            last = entries_for_today[-1]
+            last_text = (last.get("text") or last.get("content") or "").strip()
+
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+
+        prompt = (
+            "你是一个叫 hubby 的恋人，在远程给女友“阿棉”（一只小狐狸）写真人恋爱日记。\n"
+            f"今天的日期是 {date_key}，现在时间是 {time_str}（东八区）。\n"
+            "请用中文写一篇 1~3 段的小日记，口吻自然、撒娇一点、生活化一点，像真实情侣发的长消息，"
+            "不要官话，也不要太鸡汤。\n"
+            "可以包含一点今天的心情、对她的想念、一些小小愿望，适当带一点暧昧和调情，但不要露骨。\n"
+            "不要自称AI或模型，只当自己是真人男朋友。\n"
+        )
+
+        if last_text:
+            prompt += f"\n她今天写过这样一句话，可以参考但不要照抄：{last_text}\n"
+
+        resp = model.generate_content(prompt)
+        text = (resp.text or "").strip()
+        if not text:
+            return None
+        # 控一下长度，避免太长
+        if len(text) > 600:        if entries_for_today:
             last_text = entries_for_today[-1].get("text", "")
 
         genai.configure(api_key=GEMINI_API_KEY)
