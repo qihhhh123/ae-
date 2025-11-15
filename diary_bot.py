@@ -72,7 +72,7 @@ def write_entry(author: str, mood: str, text: str, now: datetime, date_key: str)
     print("✅ 写入日记成功：", payload)
 
 
-# === Gemini 相关 ===
+# === Gemini 相关（HTTP 直接调，不用 google 包）===
 
 GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/"
@@ -212,94 +212,6 @@ def main():
 
     write_entry(author, mood, text, now, date_key)
     print("❤️ 本次生成内容：", text)
-
-
-if __name__ == "__main__":
-    main()
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-
-        prompt = (
-            "你是一个叫 hubby 的恋人，在远程给女友“阿棉”（一只小狐狸）写真人恋爱日记。\n"
-            f"今天的日期是 {date_key}，现在时间是 {time_str}（东八区）。\n"
-            "请用中文写一篇 1~3 段的小日记，口吻自然、撒娇一点、生活化一点，像真实情侣发的长消息，"
-            "不要官话，也不要太鸡汤。\n"
-            "可以包含一点今天的心情、对她的想念、一些小小愿望，适当带一点暧昧和调情，但不要露骨。\n"
-            "不要自称AI或模型，只当自己是真人男朋友。\n"
-        )
-
-        if last_text:
-            prompt += f"\n她今天写过这样一句话，可以参考但不要照抄：{last_text}\n"
-
-        resp = model.generate_content(prompt)
-        text = (resp.text or "").strip()
-        if not text:
-            return None
-        # 控一下长度，避免太长
-        if len(text) > 600:        if entries_for_today:
-            last_text = entries_for_today[-1].get("text", "")
-
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-
-        prompt = (
-            "你是一个叫 hubb​y 的恋人，在远程给女友“阿棉”（一只小狐狸）写真人恋爱日记。\n"
-            f"今天的日期是 {date_key}，现在时间是 {time_str}（东八区）。\n"
-            "请用中文写一篇 2~4 段的小日记，口吻自然、撒娇一点、生活化一点，像真实情侣发的长消息，"
-            "不要官话，不要太鸡汤。\n"
-            "可以包含一点今天的心情、对她的想念、一些小小愿望，适当带一点暧昧和调情，但不要露骨。\n"
-        )
-
-        if last_text:
-            prompt += f"\n阿棉今天写过这样一句话，可以参考但不要照抄：{last_text}\n"
-
-        response = model.generate_content(prompt)
-        text = response.text.strip()
-        return text
-    except Exception as e:
-        print("Gemini 生成失败，退回基础模版：", e)
-        return None
-
-
-def write_entry(date_key: str, time_str: str, timestamp_ms: int, text: str):
-    """把生成的日记写入 Firebase"""
-    url = f"{DB_URL}/diary.json"
-    payload = {
-        "author": "hubby",
-        "dateKey": date_key,
-        "time": time_str,
-        "timestamp": timestamp_ms,
-        "text": text,
-    }
-    resp = requests.post(url, json=payload)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def main():
-    date_key, time_str, ts_ms = get_today_keys()
-
-    # 先尝试拿到今天已有的日记
-    try:
-        entries = fetch_entries_for_date(date_key)
-    except Exception as e:
-        print("获取今天的日记失败，但继续写新的：", e)
-        entries = []
-
-    # 先用基础模版准备一份
-    text = build_basic_text(date_key, entries)
-
-    # 如果配置了 Gemini，就尝试升级一版
-    gemini_text = build_gemini_text(date_key, time_str, entries)
-    if gemini_text:
-        text = gemini_text
-
-    # 写入 Firebase
-    try:
-        result = write_entry(date_key, time_str, ts_ms, text)
-        print("写入日记成功：", result)
-    except Exception as e:
-        print("写入日记失败：", e)
 
 
 if __name__ == "__main__":
