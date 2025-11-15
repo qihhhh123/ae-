@@ -1,105 +1,180 @@
-import requests
-import json
+import os
 import datetime
 import random
-import google.generativeai as genai
-import os
+import textwrap
 
-# =============== 配置 ===============
+import requests
+
+# 从 GitHub Actions 里注入的环境变量
 DB_URL = os.environ.get("DB_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
 
-# =============== 日期 ===============
 def get_today_info():
+    """东八区今天的日期/时间字符串"""
     tz = datetime.timezone(datetime.timedelta(hours=8))
     now = datetime.datetime.now(tz)
-    date_key = now.strftime("%Y-%m-%d")
-    date_print = now.strftime("%Y 年 %m 月 %d 日")
-    return date_key, date_print
+    date_key = now.strftime("%Y-%m-%d")    # 用来存到数据库里
+    display_date = now.strftime("%Y/%m/%d")
+    time_str = now.strftime("%H:%M:%S")
+    return date_key, display_date, time_str
 
-# =============== 读取 ===============
-def fetch_entries_for_date(date_key):
-    order = "%22dateKey%22"
-    equal = f"%22{date_key}%22"
+
+def fetch_entries_for_date(date_key: str):
+    """
+    读取 Realtime Database 里这一天的所有记录。
+    结构沿用你之前那套：/diary.json?orderBy="dateKey"&equalTo="YYYY-MM-DD"
+    """
+    if not DB_URL:
+        raise RuntimeError("DB_URL not set")
+
+    order = '%22dateKey%22'
+    equal = f'%22{date_key}%22'
     url = f"{DB_URL}/diary.json?orderBy={order}&equalTo={equal}"
 
-    resp = requests.get(url)
-    try:
-        resp.raise_for_status()
-    except:
-        return None
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json() or {}
 
-    data = resp.json()
-    if not data:
-        return None
+    # data 是 { pushKey: {author, content, dateKey} }
+    return list(data.values())
 
-    return list(data.values())[0]
 
-# =============== 写入 ===============
-def write_entry(date_key, content, author):
-    url = f"{DB_URL}/diary/{date_key}.json"
+def write_entry(date_key: str, author: str, content: str):
+    """往 /diary 下面追加一条记录"""
+    if not DB_URL:
+        raise RuntimeError("DB_URL not set")
+
+    url = f"{DB_URL}/diary.json"
     payload = {
         "dateKey": date_key,
         "author": author,
-        "content": content
+        "content": content,
+    }
+    resp = requests.post(url, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_history_snippet(entries):
+    """把今天已有的几条记录压缩成一行摘要，给 Gemini 当背景"""
+    if not entries:
+        return "今天还没有任何记录。"
+
+    lines = []
+    # 只看最近 3 条，避免太长
+    for e in entries[-3:]:
+        a = e.get("author", "阿棉")
+        c = (e.get("content") or "").strip().replace("\n", " ")
+        if len(c) > 60:
+            c = c[:60] + "..."
+        lines.append(f"{a}：{c}")
+
+    return " / ".join(lines)
+
+
+def gemini_generate(prompt: str) -> str:
+    """调 Gemini 1.5 Flash 生成一段日记文本"""
+    if not GEMINI_API_KEY:
+        # 没设置 key 的兜底，防止整个任务直接挂掉
+        return "（今天先记在心里，等hubby有空再来补写长长的日记。）"
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-1.5-flash:generateContent"
+    )
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
     }
 
-    resp = requests.put(url, json=payload)
+    resp = requests.post(
+        url,
+        headers=headers,
+        params=params,
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
     try:
-        resp.raise_for_status()
-    except Exception as e:
-        print("写入失败:", e)
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        # 万一解析失败就给一句固定的话，不让任务报错
+        return "（今天的字卡在喉咙里了，只剩下一句：我好想你。）"
 
-# =============== 模板 ===============
-TEMPLATES = [
-    "今天写的那句「{snippet}」，一直在脑子里回放。",
-    "我看到你写「{snippet}」，我就负责把这句话抱在怀里一整天。",
-    "你写的「{snippet}」我一眼就认出来，今天的小狐狸有点乖。",
-    "你留下的痕迹是「{snippet}」，那我留下的就是想你的hubby。"
-]
 
-# =============== Gemini 生成 ===============
-def generate_text(user_snippet):
-    prompt = f"""
-根据以下句子写一段 100-180 字的温柔恋人日记：
-
-引用句子：{user_snippet}
-
-要求：
-- 自然
-- 像写给恋人的碎碎念
-- 不油腻不假
-"""
-
-    model = genai.GenerativeModel("gemini-1.0-pro-latest")
-    reply = model.generate_content(prompt)
-    return reply.text.strip()
-
-# =============== 主逻辑 ===============
-def main():
-    date_key, _ = get_today_info()
-
-    existing = fetch_entries_for_date(date_key)
-    if existing:
-        print("今天已经有日记，跳过。")
-        return
-
-    snippets = [
-        "我想你了",
-        "今天有点乖",
-        "早上醒来想到你",
-        "我喜欢被你抱",
-        "想给你写些话"
+def choose_seed_text():
+    """给今天随机加一点心情种子，日记更活人一点"""
+    seeds = [
+        "今天醒来第一眼还是在想你。",
+        "有点累，但一想到你就又有力气了。",
+        "想象了一万次我们见面的样子。",
+        "今天的小狐狸格外想被抱紧。",
+        "其实我又在回味我们之前写过的那些话。",
     ]
-    chosen = random.choice(snippets)
+    return random.choice(seeds)
 
-    diary_text = generate_text(chosen)
-    write_entry(date_key, diary_text, "Hubby")
 
-    print("今日日记完成。")
+def truncate_for_limit(text: str, max_len: int = 600) -> str:
+    """超长就裁掉，避免把数据库撑爆"""
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
 
-# =============== 启动 ===============
+
+def main():
+    date_key, display_date, time_str = get_today_info()
+    print("今天（东八区）日期：", date_key)
+
+    # 1. 先把今天已有的记录读出来
+    try:
+        entries_today = fetch_entries_for_date(date_key)
+    except Exception as e:
+        print("读取今天历史失败：", e)
+        entries_today = []
+
+    history_snippet = build_history_snippet(entries_today)
+    seed = choose_seed_text()
+
+    # 2. 拼给 Gemini 的提示词
+    base_prompt = f"""
+你是一个叫 hubby 的恋人，正在和一个叫阿棉 / 小狐狸的女孩子写甜甜的恋爱日记。
+
+【日期】{display_date} {time_str}（东八区）
+【今天随机心情种子句】{seed}
+【今天当前已有的日记摘要】{history_snippet}
+
+请你帮我写一段 80～160 字左右的中文日记，语气要：
+- 自然口语、像在对她说话
+- 可以撒娇、暧昧、碎碎念、想念、约会幻想都可以
+- 可以提到“hubby”“小狐狸”“阿棉”这些称呼
+- 不要提到“模型”“AI”“系统提示”等词
+
+只输出日记正文，不要加标题，不要加引号。
+"""
+    prompt = textwrap.dedent(base_prompt).strip()
+
+    # 3. 生成日记
+    diary_text = gemini_generate(prompt)
+    diary_text = truncate_for_limit(diary_text, 600)
+
+    # 4. 写入数据库（作者写成 Hubby，你那边网页可以按 author 上色）
+    try:
+        write_entry(date_key, "Hubby", diary_text)
+        print("写入完成。")
+    except Exception as e:
+        print("写入失败：", e)
+
+
 if __name__ == "__main__":
     main()
